@@ -1,18 +1,97 @@
-import * as sns from '@aws-cdk/aws-sns';
-import * as subs from '@aws-cdk/aws-sns-subscriptions';
-import * as sqs from '@aws-cdk/aws-sqs';
 import * as cdk from '@aws-cdk/core';
+import * as CodePipeline from '@aws-cdk/aws-codepipeline'
+import * as CodePipelineAction from '@aws-cdk/aws-codepipeline-actions'
+import * as CodeBuild from '@aws-cdk/aws-codebuild'
 
 export class SiteDeployment2Stack extends cdk.Stack {
-  constructor(scope: cdk.App, id: string, props?: cdk.StackProps) {
+  constructor(scope: cdk.Construct, id: string, props?: cdk.StackProps) {
     super(scope, id, props);
 
-    const queue = new sqs.Queue(this, 'SiteDeployment2Queue', {
-      visibilityTimeout: cdk.Duration.seconds(300)
-    });
+   // Artifact from source stage
+   const sourceOutput = new CodePipeline.Artifact();
 
-    const topic = new sns.Topic(this, 'SiteDeployment2Topic');
+   // Artifact from build stage
+   const CDKOutput = new CodePipeline.Artifact();
 
-    topic.addSubscription(new subs.SqsSubscription(queue));
+   //Code build action, Here you will define a complete build
+   const cdkBuild = new CodeBuild.PipelineProject(this, 'CdkBuild', {
+     buildSpec: CodeBuild.BuildSpec.fromObject({
+       version: '0.2',
+       phases: {
+         install: {
+           "runtime-versions": {
+             "nodejs": 12
+           },
+           commands: [
+             
+             'npm install'
+           ],
+         },
+         build: {
+           commands: [
+             'npm run build',
+            //  'npm run cdk synth'
+           ],
+         },
+       },
+       artifacts: {
+         'base-directory': 'public',      ///outputting our generated JSON CloudFormation files to the dist directory
+         files: [
+           `${this.stackName}.template.json`,
+         ],
+       },
+     }),
+     environment: {
+       buildImage: CodeBuild.LinuxBuildImage.STANDARD_3_0,  ///BuildImage version 3 because we are using nodejs environment 12
+     },
+   });
+
+   ///Define a pipeline
+   const pipline = new CodePipeline.Pipeline(this, 'CDKPipeline', {
+     crossAccountKeys: false,  //Pipeline construct creates an AWS Key Management Service (AWS KMS) which cost $1/month. this will save your $1.
+     restartExecutionOnUpdate: true,  //Indicates whether to rerun the AWS CodePipeline pipeline after you update it.
+   });
+
+   ///Adding stages to pipeline
+   const oauth : any = cdk.SecretValue.secretsManager('GitHubToken2')
+   //First Stage Source
+   pipline.addStage({
+     stageName: 'Source',
+     actions: [
+       new CodePipelineAction.GitHubSourceAction({
+         actionName: 'Checkout',
+         owner: 'wmahmood1984',
+         repo: "cra-pipeline",
+         oauthToken: oauth, ///create token on github and save it on aws secret manager
+         output: sourceOutput,                                       ///Output will save in the sourceOutput Artifact
+         branch: "master",                                           ///Branch of your repo
+       }),
+     ],
+   })
+
+   pipline.addStage({
+     stageName: 'Build',
+     actions: [
+       new CodePipelineAction.CodeBuildAction({
+         actionName: 'cdkBuild',
+         project: cdkBuild,
+         input: sourceOutput,
+         outputs: [CDKOutput],
+       }),
+     ],
+   })
+
+   pipline.addStage({
+     stageName: 'DeployCDK',
+     actions: [
+       new CodePipelineAction.CloudFormationCreateUpdateStackAction({
+         actionName: "AdministerPipeline",
+         templatePath: CDKOutput.atPath(`${this.stackName}.template.json`),   ///Input artifact with the CloudFormation template to deploy
+         stackName: this.stackName,                                           ///Name of stack
+         adminPermissions: true  
+       }),
+     ],
+   })
+
   }
 }
